@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Interactive Confidence Calibration Tool</title>
+<style>
+  :root { --ink:#1d2433; --muted:#5b6475; --line:#d9dde5; --bg:#f5f6f9; --card:#fff; --accent:#0b6e6e; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color:var(--ink); background:var(--bg); }
+  main { max-width:960px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { font-size:1.4rem; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
+  canvas { width:100%; height:auto; display:block; border-radius:8px; border:1px solid var(--line); background:#ddd; }
+  .row { display:flex; align-items:baseline; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+  label.big { font-weight:600; }
+  #thrVal { font-size:1.6rem; font-weight:700; color:var(--accent); font-variant-numeric:tabular-nums; }
+  input[type=range] { width:100%; margin:10px 0 2px; accent-color:var(--accent); height:32px; }
+  .ticks { display:flex; justify-content:space-between; color:var(--muted); font-size:.8rem; }
+  #count { font-size:1.05rem; margin:12px 0 0; }
+  .btns { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
+  button, .filebtn { font:inherit; padding:9px 14px; border-radius:8px; border:1px solid var(--line); background:#fff; color:var(--ink); cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
+  button:focus-visible, input:focus-visible { outline:3px solid #7aa7ff; outline-offset:2px; }
+  .check { display:flex; gap:8px; align-items:center; margin-top:12px; color:var(--muted); }
+  .check input:disabled + span { opacity:.5; }
+  #status { min-height:1.5em; margin:10px 0 0; color:var(--accent); font-weight:600; }
+  details summary { cursor:pointer; font-weight:600; }
+  details p, details pre { color:var(--muted); font-size:.9rem; }
+  pre { background:#f0f2f6; padding:10px; border-radius:8px; overflow-x:auto; }
+  .names { display:flex; gap:12px; flex-wrap:wrap; }
+  .names label { flex:1 1 200px; display:flex; flex-direction:column; font-weight:600; font-size:.9rem; gap:4px; }
+  .names input { font:inherit; padding:8px 10px; border:1px solid var(--line); border-radius:8px; }
+  .legend { color:var(--muted); font-size:.85rem; margin:8px 0 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Interactive Confidence Calibration Tool</h1>
+  <p class="sub">Drag the slider to change the confidence threshold. Only detections at or above it stay visible. Find the setting where the boxes best match the flax seeds.</p>
+
+  <section class="card" aria-label="Participant name">
+    <div class="names">
+      <label>First name <input id="fn" type="text" autocomplete="given-name"></label>
+      <label>Last name <input id="ln" type="text" autocomplete="family-name"></label>
+    </div>
+  </section>
+
+  <section class="card" aria-label="Detection image">
+    <canvas id="cv" role="img" aria-label="Seed image with detection boxes"></canvas>
+    <p class="legend">Each box is a detection labelled with the model's confidence that the object is a flax seed.</p>
+    <p class="legend" id="meta"></p>
+  </section>
+
+  <section class="card" aria-label="Controls">
+    <div class="row">
+      <label class="big" for="thr">Confidence threshold</label>
+      <span id="thrVal" aria-hidden="true">0%</span>
+    </div>
+    <input id="thr" type="range" min="0" max="100" step="1" value="0" aria-describedby="count">
+    <div class="ticks" aria-hidden="true"><span>0% (show all)</span><span id="tMid">50%</span><span id="tMax">100% (only most certain)</span></div>
+    <p id="count" aria-live="polite"></p>
+
+    <label class="check"><input id="gt" type="checkbox" disabled><span id="gtTxt">Reveal ground truth (not available: the loaded detections have no labels)</span></label>
+
+    <div class="btns">
+      <button id="save" class="primary">Save this as my preferred threshold</button>
+      <button id="csv">Download log (CSV)</button>
+    </div>
+    <p id="status" role="status"></p>
+  </section>
+
+</main>
+
+<script>
+// ---------- Configuration ----------
+// Optional: paste your Google Apps Script web-app URL to log events to a Google Sheet.
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbw2j6InHfaEuGtwaSZAeFcwSPXmbPGiE6_dVYYpmIJsgmilIAG6cKrkHpr-FIX47Y_Fmg/exec';
+const SESSION = Math.random().toString(36).slice(2, 10);
+
+// ---------- State ----------
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const $ = id => document.getElementById(id);
+let base = null, dets = [], W = 1672, H = 941, source = 'seeds.jpg';
+const log = [];
+
+// ---------- Default image and cached detections ----------
+// Cached output of OWLv2 (pre-trained, no fine-tuning) run once on seeds.jpg using an example image of a
+// flax seed as the query (see seeds_owlv2_imgquery.json). Scores are exactly as the model returned them.
+const DEFAULT_IMG = 'seeds.jpg';
+const DEFAULT_META = {"model":"google/owlv2-base-patch16-ensemble","query":"image example: flax_reference.png","min_score":0.02,"nms_iou":0.3,"max_area_fraction":0.2,"run_date":"2026-11-09","training_or_fine_tuning":"none (pre-trained model used as released)","transformers":"5.22.1","torch":"2.14.1+cpu"};
+const DEFAULT_DETS = [{"label":"flax seed","confidence":0.02,"box":[0,5,1516,192]},{"label":"flax seed","confidence":0.027,"box":[48,45,723,111]},{"label":"flax seed","confidence":0.867,"box":[60,65,106,75]},{"label":"flax seed","confidence":0.042,"box":[111,73,20,15]},{"label":"flax seed","confidence":0.029,"box":[121,65,44,23]},{"label":"flax seed","confidence":0.993,"box":[257,59,110,80]},{"label":"flax seed","confidence":0.269,"box":[333,59,33,27]},{"label":"flax seed","confidence":0.962,"box":[443,57,140,86]},{"label":"flax seed","confidence":0.885,"box":[672,65,108,74]},{"label":"flax seed","confidence":0.037,"box":[698,75,23,17]},{"label":"flax seed","confidence":0.022,"box":[718,69,30,22]},{"label":"flax seed","confidence":0.024,"box":[734,74,38,37]},{"label":"flax seed","confidence":0.045,"box":[758,70,23,29]},{"label":"flax seed","confidence":0.993,"box":[882,59,106,80]},{"label":"flax seed","confidence":0.145,"box":[960,58,26,20]},{"label":"flax seed","confidence":0.965,"box":[1085,56,128,88]},{"label":"flax seed","confidence":0.851,"box":[1302,64,106,77]},{"label":"flax seed","confidence":0.042,"box":[1355,64,46,28]},{"label":"flax seed","confidence":0.034,"box":[1387,65,20,20]},{"label":"flax seed","confidence":0.993,"box":[1504,58,113,82]},{"label":"flax seed","confidence":0.023,"box":[1583,62,35,58]},{"label":"flax seed","confidence":0.232,"box":[1593,59,23,22]},{"label":"flax seed","confidence":0.963,"box":[43,207,147,88]},{"label":"flax seed","confidence":0.063,"box":[65,85,43,41]},{"label":"flax seed","confidence":0.052,"box":[94,112,22,17]},{"label":"flax seed","confidence":0.043,"box":[109,103,23,18]},{"label":"flax seed","confidence":0.029,"box":[130,81,29,21]},{"label":"flax seed","confidence":0.026,"box":[147,77,17,17]},{"label":"flax seed","confidence":0.846,"box":[259,213,109,71]},{"label":"flax seed","confidence":0.993,"box":[459,209,113,81]},{"label":"flax seed","confidence":0.209,"box":[548,209,24,19]},{"label":"flax seed","confidence":0.961,"box":[657,206,135,87]},{"label":"flax seed","confidence":0.028,"box":[676,106,38,26]},{"label":"flax seed","confidence":0.048,"box":[702,113,21,15]},{"label":"flax seed","confidence":0.082,"box":[734,86,19,20]},{"label":"flax seed","confidence":0.209,"box":[875,113,59,25]},{"label":"flax seed","confidence":0.851,"box":[887,213,99,71]},{"label":"flax seed","confidence":0.022,"box":[947,213,39,27]},{"label":"flax seed","confidence":0.103,"box":[1081,121,12,15]},{"label":"flax seed","confidence":0.993,"box":[1091,210,113,78]},{"label":"flax seed","confidence":0.063,"box":[1095,129,59,15]},{"label":"flax seed","confidence":0.207,"box":[1181,211,18,17]},{"label":"flax seed","confidence":0.957,"box":[1283,206,146,87]},{"label":"flax seed","confidence":0.076,"box":[1324,85,25,33]},{"label":"flax seed","confidence":0.048,"box":[1345,109,20,17]},{"label":"flax seed","confidence":0.032,"box":[1380,76,23,23]},{"label":"flax seed","confidence":0.044,"box":[1410,222,18,19]},{"label":"flax seed","confidence":0.85,"box":[1511,213,106,71]},{"label":"flax seed","confidence":0.032,"box":[1547,217,35,29]},{"label":"flax seed","confidence":0.04,"box":[1592,220,21,26]},{"label":"flax seed","confidence":0.023,"box":[40,337,738,110]},{"label":"flax seed","confidence":0.042,"box":[42,268,13,16]},{"label":"flax seed","confidence":0.995,"box":[49,357,124,79]},{"label":"flax seed","confidence":0.104,"box":[52,264,110,30]},{"label":"flax seed","confidence":0.285,"box":[151,359,19,17]},{"label":"flax seed","confidence":0.956,"box":[242,356,144,84]},{"label":"flax seed","confidence":0.031,"box":[291,254,21,17]},{"label":"flax seed","confidence":0.05,"box":[305,226,20,18]},{"label":"flax seed","confidence":0.04,"box":[305,258,21,15]},{"label":"flax seed","confidence":0.255,"box":[463,270,22,18]},{"label":"flax seed","confidence":0.886,"box":[467,359,108,72]},{"label":"flax seed","confidence":0.03,"box":[530,362,42,31]},{"label":"flax seed","confidence":0.067,"box":[656,262,24,27]},{"label":"flax seed","confidence":0.038,"box":[665,264,104,31]},{"label":"flax seed","confidence":0.993,"box":[671,357,110,81]},{"label":"flax seed","confidence":0.285,"box":[753,357,28,20]},{"label":"flax seed","confidence":0.954,"box":[877,354,125,85]},{"label":"flax seed","confidence":0.023,"box":[904,243,27,27]},{"label":"flax seed","confidence":0.033,"box":[926,253,19,17]},{"label":"flax seed","confidence":0.043,"box":[990,371,16,18]},{"label":"flax seed","confidence":0.835,"box":[1093,360,107,73]},{"label":"flax seed","confidence":0.164,"box":[1281,265,21,22]},{"label":"flax seed","confidence":0.049,"box":[1289,263,116,32]},{"label":"flax seed","confidence":0.992,"box":[1294,356,114,79]},{"label":"flax seed","confidence":0.271,"box":[1385,357,22,20]},{"label":"flax seed","confidence":0.044,"box":[1392,227,26,25]},{"label":"flax seed","confidence":0.967,"box":[1486,354,142,82]},{"label":"flax seed","confidence":0.044,"box":[1512,263,16,15]},{"label":"flax seed","confidence":0.043,"box":[1519,248,52,34]},{"label":"flax seed","confidence":0.088,"box":[1563,228,20,14]},{"label":"flax seed","confidence":0.048,"box":[1568,240,22,17]},{"label":"flax seed","confidence":0.038,"box":[1619,375,12,15]},{"label":"flax seed","confidence":0.024,"box":[54,484,715,109]},{"label":"flax seed","confidence":0.883,"box":[55,510,110,71]},{"label":"flax seed","confidence":0.064,"box":[244,417,12,14]},{"label":"flax seed","confidence":0.024,"box":[256,415,87,28]},{"label":"flax seed","confidence":0.995,"box":[257,504,114,85]},{"label":"flax seed","confidence":0.961,"box":[446,503,146,84]},{"label":"flax seed","confidence":0.024,"box":[468,398,33,25]},{"label":"flax seed","confidence":0.871,"box":[674,509,105,73]},{"label":"flax seed","confidence":0.033,"box":[738,523,32,23]},{"label":"flax seed","confidence":0.084,"box":[863,415,26,21]},{"label":"flax seed","confidence":0.994,"box":[882,503,105,80]},{"label":"flax seed","confidence":0.954,"box":[1074,503,139,85]},{"label":"flax seed","confidence":0.021,"box":[1124,385,40,31]},{"label":"flax seed","confidence":0.048,"box":[1155,392,18,16]},{"label":"flax seed","confidence":0.888,"box":[1302,509,106,71]},{"label":"flax seed","confidence":0.027,"box":[1379,510,28,24]},{"label":"flax seed","confidence":0.124,"box":[1485,407,16,20]},{"label":"flax seed","confidence":0.022,"box":[1486,410,104,33]},{"label":"flax seed","confidence":0.025,"box":[1487,409,38,22]},{"label":"flax seed","confidence":0.993,"box":[1504,502,110,85]},{"label":"flax seed","confidence":0.076,"box":[1574,503,40,61]},{"label":"flax seed","confidence":0.973,"box":[40,647,146,89]},{"label":"flax seed","confidence":0.021,"box":[91,545,34,22]},{"label":"flax seed","confidence":0.875,"box":[260,657,109,72]},{"label":"flax seed","confidence":0.994,"box":[459,653,118,79]},{"label":"flax seed","confidence":0.051,"box":[464,560,97,29]},{"label":"flax seed","confidence":0.128,"box":[553,654,24,21]},{"label":"flax seed","confidence":0.964,"box":[654,649,140,88]},{"label":"flax seed","confidence":0.025,"box":[695,535,50,40]},{"label":"flax seed","confidence":0.867,"box":[882,658,99,73]},{"label":"flax seed","confidence":0.051,"box":[1083,557,111,34]},{"label":"flax seed","confidence":0.993,"box":[1090,653,118,82]},{"label":"flax seed","confidence":0.338,"box":[1160,653,45,20]},{"label":"flax seed","confidence":0.962,"box":[1286,650,145,85]},{"label":"flax seed","confidence":0.907,"box":[1511,657,106,73]},{"label":"flax seed","confidence":0.046,"box":[1548,674,34,27]},{"label":"flax seed","confidence":0.02,"box":[1570,664,41,36]},{"label":"flax seed","confidence":0.022,"box":[1583,658,29,19]},{"label":"flax seed","confidence":0.038,"box":[39,786,733,111]},{"label":"flax seed","confidence":0.995,"box":[49,804,119,83]},{"label":"flax seed","confidence":0.026,"box":[74,737,49,35]},{"label":"flax seed","confidence":0.247,"box":[130,803,37,29]},{"label":"flax seed","confidence":0.972,"box":[239,806,147,86]},{"label":"flax seed","confidence":0.098,"box":[302,693,37,28]},{"label":"flax seed","confidence":0.06,"box":[313,676,22,17]},{"label":"flax seed","confidence":0.02,"box":[326,812,59,55]},{"label":"flax seed","confidence":0.861,"box":[466,809,109,71]},{"label":"flax seed","confidence":0.027,"box":[525,815,23,21]},{"label":"flax seed","confidence":0.02,"box":[551,813,23,23]},{"label":"flax seed","confidence":0.056,"box":[665,705,115,34]},{"label":"flax seed","confidence":0.995,"box":[670,806,110,83]},{"label":"flax seed","confidence":0.086,"box":[726,806,58,42]},{"label":"flax seed","confidence":0.979,"box":[882,807,128,85]},{"label":"flax seed","confidence":0.03,"box":[886,721,14,12]},{"label":"flax seed","confidence":0.04,"box":[919,784,721,111]},{"label":"flax seed","confidence":0.036,"box":[934,700,15,12]},{"label":"flax seed","confidence":0.025,"box":[937,690,31,21]},{"label":"flax seed","confidence":0.068,"box":[1092,699,69,36]},{"label":"flax seed","confidence":0.918,"box":[1100,810,106,73]},{"label":"flax seed","confidence":0.027,"box":[1170,819,29,33]},{"label":"flax seed","confidence":0.027,"box":[1185,815,17,16]},{"label":"flax seed","confidence":0.149,"box":[1288,709,28,23]},{"label":"flax seed","confidence":0.995,"box":[1293,807,115,77]},{"label":"flax seed","confidence":0.049,"box":[1311,718,62,19]},{"label":"flax seed","confidence":0.275,"box":[1390,807,20,22]},{"label":"flax seed","confidence":0.973,"box":[1490,807,145,85]},{"label":"flax seed","confidence":0.039,"box":[1515,709,23,16]},{"label":"flax seed","confidence":0.045,"box":[1554,704,20,14]},{"label":"flax seed","confidence":0.03,"box":[1574,686,25,22]},{"label":"flax seed","confidence":0.166,"box":[1604,812,30,29]},{"label":"flax seed","confidence":0.045,"box":[0,935,1555,6]},{"label":"flax seed","confidence":0.097,"box":[241,864,31,23]},{"label":"flax seed","confidence":0.08,"box":[255,860,114,33]},{"label":"flax seed","confidence":0.054,"box":[486,850,25,24]},{"label":"flax seed","confidence":0.086,"box":[516,836,23,20]},{"label":"flax seed","confidence":0.047,"box":[866,867,113,28]},{"label":"flax seed","confidence":0.042,"box":[1153,862,17,10]},{"label":"flax seed","confidence":0.103,"box":[1491,866,20,20]},{"label":"flax seed","confidence":0.073,"box":[1497,862,111,32]}];
+
+let fine = false;   // show one decimal place when scores are small
+const pct = v => fine ? (v * 100).toFixed(1) : String(Math.round(v * 100));
+
+// Fit the slider to the scores in the loaded file, so its whole range is useful.
+function setDets(list) {
+  dets = list;
+  const mx = dets.reduce((m, d) => Math.max(m, d.confidence), 0);
+  const top = Math.min(100, Math.max(5, Math.ceil(mx * 100 / 5) * 5));
+  fine = true;   // one decimal and 0.5% steps, so scores that sit close together can still be told apart
+  const r = $('thr'); r.min = 0; r.max = top; r.step = fine ? 0.5 : 1; r.value = 0;
+  $('tMid').textContent = (top / 2) + '%';
+  $('tMax').textContent = top + '%' + (top === 100 ? ' (only most certain)' : ' (highest score in this file)');
+  const hasGt = dets.length > 0 && dets.every(d => 'correct' in d);
+  $('gt').disabled = !hasGt; if (!hasGt) $('gt').checked = false;
+  $('gtTxt').textContent = hasGt ? 'Reveal ground truth (developer view: green = flax, red dashed = not flax)'
+                                 : 'Reveal ground truth (not available: the loaded detections have no labels)';
+}
+
+function loadDefault() {
+  const img = new Image();
+  img.onload = () => { base = img; W = img.naturalWidth; H = img.naturalHeight;
+    setDets(DEFAULT_DETS.map(d => ({ ...d })));
+    source = DEFAULT_IMG; $('status').textContent = '';
+    $('meta').textContent = `Detections: ${DEFAULT_META.model}, query: ${DEFAULT_META.query}, run ${DEFAULT_META.run_date}, no training or fine-tuning. Scores are the model's raw output.`;
+    render(); };
+  img.onerror = () => { $('status').textContent = 'Could not load seeds.jpg. Keep it in the same folder as index.html.'; };
+  img.src = DEFAULT_IMG;
+}
+
+// ---------- Rendering ----------
+function render() {
+  cv.width = W; cv.height = H;
+  ctx.drawImage(base, 0, 0, W, H);
+  const t = +$('thr').value / 100, gt = $('gt').checked && dets.every(d => 'correct' in d);
+  const k = W / 800, fs = Math.max(11, 12 * k);
+  ctx.font = `600 ${fs}px system-ui, sans-serif`; ctx.textBaseline = 'top';
+  let shown = 0, tp = 0, fp = 0, total = dets.length;
+  const vis = dets.filter(d => d.confidence >= t).sort((a, b) => a.confidence - b.confidence);
+  for (const d of vis) {
+    const [x, y, w, h] = d.box; shown++;
+    d.correct ? tp++ : fp++;
+    ctx.lineWidth = (1.5 + 3 * d.confidence) * k;
+    ctx.setLineDash(gt && !d.correct ? [6 * k, 4 * k] : []);
+    ctx.strokeStyle = gt ? (d.correct ? '#14a44d' : '#d62839') : '#0b6e6e';
+    ctx.globalAlpha = gt ? 1 : 0.55 + 0.45 * d.confidence;
+    ctx.strokeRect(x, y, w, h); ctx.setLineDash([]);
+    const txt = pct(d.confidence) + '%', tw = ctx.measureText(txt).width + 6 * k;
+    ctx.fillStyle = ctx.strokeStyle; ctx.fillRect(x, y - fs - 3 * k, tw, fs + 3 * k);
+    ctx.fillStyle = '#fff'; ctx.fillText(txt, x + 3 * k, y - fs - 1 * k);
+    ctx.globalAlpha = 1;
+  }
+  $('thrVal').textContent = pct(t) + '%';
+  $('thr').setAttribute('aria-valuetext', pct(t) + ' percent');
+  let msg = `Showing ${shown} of ${total} detections at or above ${pct(t)}%.`;
+  if (gt) { const flaxTotal = dets.filter(d => d.correct).length; msg += ` Flax: ${tp} of ${flaxTotal} · Not flax: ${fp}.`; }
+  $('count').textContent = msg;
+  return shown;
+}
+
+// ---------- Logging ----------
+function record(event) {
+  const rec = { first: $('fn').value.trim(), last: $('ln').value.trim(), session: SESSION, time: new Date().toISOString(), event, threshold: +$('thr').value / 100,
+                visible: render(), total: dets.length, source };
+  log.push(rec);
+  // text/plain keeps this a "simple" request (no preflight), so the script's reply ("ok") can be read back.
+  rec.sent = APPS_SCRIPT_URL
+    ? fetch(APPS_SCRIPT_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify(rec) })
+        .then(r => r.text()).then(t => t.trim() === 'ok').catch(() => false)
+    : Promise.resolve(null);
+  return rec;
+}
+function download(name, text, type) {
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type }));
+  a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+// ---------- Events ----------
+$('thr').addEventListener('input', render);
+$('gt').addEventListener('change', render);
+$('save').addEventListener('click', () => {
+  if (!$('fn').value.trim() || !$('ln').value.trim()) {
+    $('status').textContent = 'Please enter your first and last name before saving.'; $('fn').focus(); return; }
+  const rec = record('preferred_threshold_saved'), pct = $('thr').value;
+  $('status').textContent = 'Saving…';
+  rec.sent.then(ok => {
+    $('status').textContent = ok === null
+      ? `Recorded ${pct}% in this browser tab only (setup note: APPS_SCRIPT_URL is empty).`
+      : ok ? `Saved: your preferred confidence threshold is ${pct}% and it was sent to the sheet.`
+           : `Your choice of ${pct}% was recorded on this page, but we could not confirm it reached the Google Sheet. Please tell the researcher.`;
+  });
+});
+$('csv').addEventListener('click', () => {
+  if (!log.length) { $('status').textContent = 'Nothing logged yet. Save a preferred threshold first.'; return; }
+  const cols = ['first', 'last', 'session', 'time', 'event', 'threshold', 'visible', 'total', 'source'];
+  download('confidence-log.csv', [cols.join(','), ...log.map(r => cols.map(c => r[c]).join(','))].join('\n'), 'text/csv');
+});
+loadDefault();
+</script>
+</body>
+</html>
